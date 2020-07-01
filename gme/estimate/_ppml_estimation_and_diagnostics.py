@@ -10,6 +10,7 @@ from typing import Union
 import statsmodels.api as sm
 import time as time
 import traceback
+import scipy
 
 #-----------------------------------------------------------------------------------------#
 # This file contains the underlying functions for the .estimate method in EstimationModel #
@@ -55,8 +56,10 @@ def _estimate_ppml(data_frame,
     if not specification.sector_by_sector:
         data_frame = data_frame.reset_index(drop=True)
         fixed_effects_df = _generate_fixed_effects(data_frame, fixed_effects, drop_fixed_effect)
+        print("fixed effects done")
         estimating_data_frame = pd.concat(
             [data_frame[specification.lhs_var], data_frame[specification.rhs_var], fixed_effects_df], axis=1)
+        print("concat done")
         model_fit, post_diagnostics_data_frame, diagnostics_log = _regress_ppml(estimating_data_frame, specification)
         results_dict['all'] = model_fit
         end_time = time.time()
@@ -199,6 +202,140 @@ def _sectors(data_frame, meta_data):
 # PPML Regression and pre-diagnostics
 # -------------
 
+class _GLM(sm.GLM):
+    """
+    The same as a statsmodels Generalized Linear Model (GLM), but
+    using sparse linear algebra from scipy within the iteratively reweighted
+    least squares (IRLS) algorithm
+    """
+    def _fit_irls(self, start_params=None, maxiter=100, tol=1e-8,
+                  scale=None, cov_type='nonrobust', cov_kwds=None,
+                  use_t=None, **kwargs):
+        """
+        Fits a generalized linear model for a given family using
+        iteratively reweighted least squares (IRLS).
+        """
+
+        import statsmodels.regression.linear_model as lm
+        from statsmodels.genmod.generalized_linear_model import _check_convergence
+
+        attach_wls = kwargs.pop('attach_wls', False)
+        atol = kwargs.get('atol')
+        rtol = kwargs.get('rtol', 0.)
+        tol_criterion = kwargs.get('tol_criterion', 'deviance')
+        wls_method = kwargs.get('wls_method', 'lstsq')
+        atol = tol if atol is None else atol
+
+        endog = self.endog
+        wlsexog = scipy.sparse.csr_matrix(self.exog)
+        if start_params is None:
+            start_params = np.ones(self.exog.shape[1])
+        sol = start_params
+        lin_pred = wlsexog.dot(start_params) + self._offset_exposure
+        mu = self.family.fitted(lin_pred)
+        self.scale = self.estimate_scale(mu)
+        dev = self.family.deviance(self.endog, mu, self.var_weights,
+                                   self.freq_weights, self.scale)
+        if np.isnan(dev):
+            raise ValueError("The first guess on the deviance function "
+                             "returned a nan.  This could be a boundary "
+                             " problem and should be reported.")
+
+        # first guess on the deviance is assumed to be scaled by 1.
+        # params are none to start, so they line up with the deviance
+        history = dict(params=[np.inf, start_params], deviance=[np.inf, dev])
+        converged = False
+        criterion = history[tol_criterion]
+        # This special case is used to get the likelihood for a specific
+        # params vector.
+        if maxiter == 0:
+            mu = self.family.fitted(lin_pred)
+            self.scale = self.estimate_scale(mu)
+            wls_results = lm.RegressionResults(self, start_params, None)
+            sol = wls_results.params
+            iteration = 0
+        for iteration in range(maxiter):
+            print(iteration)
+            self.weights = (self.iweights * self.n_trials *
+                            self.family.weights(mu))
+            wlsendog = (self.family.link.deriv(mu) * (self.endog-mu)
+                        - self._offset_exposure)
+            wls_mod = _MinimalWLS(wlsendog, wlsexog,
+                                  self.weights, check_endog=True,
+                                  check_weights=True)
+            wls_results = wls_mod.fit(method=wls_method)
+            sol += wls_results.params
+            lin_pred = np.dot(self.exog, sol)
+            lin_pred += self._offset_exposure
+            mu = self.family.fitted(lin_pred)
+            print(np.linalg.norm(self.exog.T.dot(self.endog - mu)))
+            history = self._update_history(wls_results, mu, history)
+            self.scale = self.estimate_scale(mu)
+            if endog.squeeze().ndim == 1 and np.allclose(mu - endog, 0):
+                msg = "Perfect separation detected, results not available"
+                raise PerfectSeparationError(msg)
+            converged = _check_convergence(criterion, iteration + 1, atol,
+                                           rtol)
+            if converged:
+                break
+        self.mu = mu
+
+        if maxiter > 0:  # Only if iterative used
+            wls_method2 = 'pinv' if wls_method == 'lstsq' else wls_method
+            wls_model = lm.WLS(wlsendog, wlsexog, self.weights)
+            wls_results = wls_model.fit(method=wls_method2)
+
+        glm_results = sm.GLMResults(self, wls_results.params,
+                                    wls_results.normalized_cov_params,
+                                    self.scale,
+                                    cov_type=cov_type, cov_kwds=cov_kwds,
+                                    use_t=use_t)
+
+        glm_results.method = "IRLS"
+        glm_results.mle_settings = {}
+        glm_results.mle_settings['wls_method'] = wls_method
+        glm_results.mle_settings['optimizer'] = glm_results.method
+        if (maxiter > 0) and (attach_wls is True):
+            glm_results.results_wls = wls_results
+        history['iteration'] = iteration + 1
+        glm_results.fit_history = history
+        glm_results.converged = converged
+        return sm.GLMResultsWrapper(glm_results)
+
+
+class _MinimalWLS(sm.regression._tools._MinimalWLS):
+    """
+    The same as a statsmodels.regression._tools._MinimalWLS, but
+    using sparse linear algebra from scipy for the least squares problem
+    """
+    
+    def __init__(self, endog, exog, weights=1.0, check_endog=False,
+                 check_weights=False):
+        self.endog = endog
+        self.exog = exog
+        self.weights = weights
+        w_half = np.sqrt(weights)
+        if check_weights:
+            if not np.all(np.isfinite(w_half)):
+                raise ValueError(self.msg.format('weights'))
+
+        if check_endog:
+            if not np.all(np.isfinite(endog)):
+                raise ValueError(self.msg.format('endog'))
+
+        self.wendog = w_half * endog
+        if np.isscalar(weights):
+            self.wexog = w_half * exog
+        else:
+            self.wexog = scipy.sparse.spdiags(w_half, 0, len(w_half), len(w_half)) @ exog
+
+    def fit(self, method='pinv'):
+        print(np.linalg.cond(self.wexog.toarray()), np.linalg.norm(self.wendog),np.linalg.norm(self.wexog.T.dot(self.wendog)))
+        result = scipy.sparse.linalg.lsmr(self.wexog, self.wendog, atol=1.e-16, btol=1.e-16)
+        #result = np.linalg.lstsq(self.wexog.toarray(), self.wendog, rcond=-1)
+        return self.results(result[0])
+
+
 
 def _regress_ppml(data_frame, specification):
     '''
@@ -215,9 +352,11 @@ def _regress_ppml(data_frame, specification):
     adjusted_data_frame, problem_variable_list = _trade_contingent_collinearity_check(data_frame=data_frame_copy,
                                                                                       specification=specification)
 
+    print("trade contingent collinearity check done")
     # Check for perfect collinearity
     rhs = adjusted_data_frame.drop(specification.lhs_var, axis=1)
     non_collinear_rhs, collinear_column_list = _collinearity_check(rhs)
+    print("collinearity check done")
     if len(collinear_column_list) == 0:
         collinearity_indicator = 'No'
     else:
@@ -228,11 +367,10 @@ def _regress_ppml(data_frame, specification):
     print('Omitted Columns: ' + str(excluded_column_list))
     # GLM Estimation
     try:
-        estimates = sm.GLM(endog=adjusted_data_frame[specification.lhs_var],
-                           exog=non_collinear_rhs,
-                           family=sm.families.Poisson()
-                           ).fit(cov_type=specification.std_errors,
-                                 maxiter=specification.iteration_limit)
+        glm = _GLM(endog=adjusted_data_frame[specification.lhs_var],
+                   exog=non_collinear_rhs,
+                   family=sm.families.Poisson())
+        estimates = glm.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit)
         adjusted_data_frame.loc[:,'predicted_trade'] = estimates.mu
 
         # Checks for overfit (only valid when keep=False)
