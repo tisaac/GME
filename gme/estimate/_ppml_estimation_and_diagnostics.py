@@ -10,6 +10,7 @@ from typing import Union
 import statsmodels.api as sm
 import time as time
 import traceback
+import scipy
 
 #-----------------------------------------------------------------------------------------#
 # This file contains the underlying functions for the .estimate method in EstimationModel #
@@ -199,6 +200,154 @@ def _sectors(data_frame, meta_data):
 # PPML Regression and pre-diagnostics
 # -------------
 
+from statsmodels.tools.validation import float_like
+
+class _SparseGLM(sm.GLM):
+    '''
+    This class keeps a sparse copy of the exogenous variables, `self.spexog`,
+    and uses `self.spexog.dot(x)` in place of `np.dot(self.exog, x)`.
+    '''
+    def __init__(self, *args, **kwargs):
+        super(_SparseGLM, self).__init__(*args, **kwargs)
+        self.spexog = scipy.sparse.csr_matrix(self.exog)
+
+    def loglike(self, params, scale=None):
+        """the log-likelihood for a generalized linear model
+        """
+        scale = float_like(scale, "scale", optional=True)
+        # replaced np.dot(self.exog, params) here
+        lin_pred = self.spexog.dot(params) + self._offset_exposure
+        expval = self.family.link.inverse(lin_pred)
+        if scale is None:
+            scale = self.estimate_scale(expval)
+        llf = self.family.loglike(self.endog, expval, self.var_weights,
+                                  self.freq_weights, scale)
+        return llf
+
+    def score(self, params, scale=None):
+        """score, first derivative of the loglikelihood function
+        """
+        scale = float_like(scale, "scale", optional=True)
+        score_factor = self.score_factor(params, scale=scale)
+        # replaced np.dot(score_factor, self.exog)
+        return self.spexog.T.dot(score_factor)
+
+    def hessian(self, params, scale=None, observed=None):
+        """Hessian, second derivative of loglikelihood function
+        """
+        if observed is None:
+            if getattr(self, '_optim_hessian', None) == 'eim':
+                observed = False
+            else:
+                observed = True
+        scale = float_like(scale, "scale", optional=True)
+
+        factor = self.hessian_factor(params, scale=scale, observed=observed)
+        factord = scipy.sparse.diags([factor],[0])
+        return (-self.spexog.T.dot(factord.dot(self.spexog))).toarray()
+
+    def predict(self, params, exog=None, exposure=None, offset=None,
+                linear=False):
+        """predicted values for a design matrix
+        """
+
+        # Use fit offset if appropriate
+        if offset is None and exog is None and hasattr(self, 'offset'):
+            offset = self.offset
+        elif offset is None:
+            offset = 0.
+
+        if exposure is not None and not isinstance(self.family.link,
+                                                   families.links.Log):
+            raise ValueError("exposure can only be used with the log link "
+                             "function")
+
+        # Use fit exposure if appropriate
+        if exposure is None and exog is None and hasattr(self, 'exposure'):
+            # Already logged
+            exposure = self.exposure
+        elif exposure is None:
+            exposure = 0.
+        else:
+            exposure = np.log(exposure)
+
+        if exog is None:
+            exog = self.spexog
+
+        # replace linpred = np.dot(exog, params) + offset + exposure
+        linpred = exog.dot(params) + offset + exposure
+        if linear:
+            return linpred
+        else:
+            return self.family.fitted(linpred)
+
+
+def _fit_newton_line_search(f, score, start_params, fargs, kwargs, disp=True,
+                            maxiter=100, callback=None, retall=False,
+                            full_output=True, hess=None):
+    '''
+    Newton's method like `_fit_newton` from `statsmodels`, but with
+    globalization on the objective using `scipy.optimize.line_search`.
+    '''
+    tol = kwargs.setdefault('tol', 1e-8)
+    iterations = 0
+    oldparams = np.inf
+    newparams = np.asarray(start_params)
+    if retall:
+        history = [oldparams, newparams]
+    obj = f(newparams)
+    while iterations < maxiter:
+        g = score(newparams)
+        H = np.asarray(hess(newparams))
+        delta = np.linalg.solve(H,-g)
+        alpha, _, _, obj, _, _ = scipy.optimize.line_search(f, score,
+                                                            newparams, delta,
+                                                            g, obj)
+        if alpha is None:
+            # line search break down, probably due to numerically zero
+            # delta.dot(g), end optimization
+            break
+        delta *= alpha
+        newparams = newparams + delta
+        if retall:
+            history.append(newparams)
+        if callback is not None:
+            callback(newparams)
+        if np.max(np.abs(delta)) < tol:
+            break
+        iterations +=1
+    fval = f(newparams, *fargs)  # this is the negative log-likelihood
+    if iterations == maxiter:
+        warnflag = 1
+        if disp:
+            print("Warning: Maximum number of iterations has been "
+                   "exceeded.")
+            print("         Current function value: %f" % fval)
+            print("         Iterations: %d" % iterations)
+    else:
+        warnflag = 0
+        if disp:
+            print("Optimization terminated successfully.")
+            print("         Current function value: %f" % fval)
+            print("         Iterations %d" % iterations)
+    if full_output:
+        (xopt, fopt, niter,
+         gopt, hopt) = (newparams, f(newparams, *fargs),
+                        iterations, score(newparams),
+                        hess(newparams))
+        converged = not warnflag
+        retvals = {'fopt': fopt, 'iterations': niter, 'score': gopt,
+                   'Hessian': hopt, 'warnflag': warnflag,
+                   'converged': converged}
+        if retall:
+            retvals.update({'allvecs': history})
+
+    else:
+        xopt = newparams
+        retvals = None
+
+    return xopt, retvals
+
 
 def _regress_ppml(data_frame, specification):
     '''
@@ -214,7 +363,6 @@ def _regress_ppml(data_frame, specification):
     data_frame_copy = data_frame.copy()
     adjusted_data_frame, problem_variable_list = _trade_contingent_collinearity_check(data_frame=data_frame_copy,
                                                                                       specification=specification)
-
     # Check for perfect collinearity
     rhs = adjusted_data_frame.drop(specification.lhs_var, axis=1)
     non_collinear_rhs, collinear_column_list = _collinearity_check(rhs)
@@ -228,11 +376,21 @@ def _regress_ppml(data_frame, specification):
     print('Omitted Columns: ' + str(excluded_column_list))
     # GLM Estimation
     try:
-        estimates = sm.GLM(endog=adjusted_data_frame[specification.lhs_var],
-                           exog=non_collinear_rhs,
-                           family=sm.families.Poisson()
-                           ).fit(cov_type=specification.std_errors,
-                                 maxiter=specification.iteration_limit)
+        spglm = _SparseGLM(endog=adjusted_data_frame[specification.lhs_var],
+                           exog=non_collinear_rhs, family=sm.families.Poisson())
+        # start_params: the ordinary least squares estimate by applying the link
+        # to valid endogenous values and then solve the normal equations
+        valid = (spglm.endog > spglm.family.valid[0]) * (spglm.endog < spglm.family.valid[1])
+        olsendog = spglm.family.link(spglm.endog[valid])
+        olsexog = spglm.spexog[valid,:]
+        olsrhs = olsexog.T.dot(olsendog)
+        olsmat = olsexog.T.dot(olsexog)
+        start_params = scipy.sparse.linalg.spsolve(olsmat,olsrhs)
+        estimates = spglm.fit(cov_type=specification.std_errors,
+                              start_params=start_params,
+                              maxiter=specification.iteration_limit,
+                              method='newton_line_search', max_start_irls=0,
+                              extra_fit_funcs={'newton_line_search':_fit_newton_line_search})
         adjusted_data_frame.loc[:,'predicted_trade'] = estimates.mu
 
         # Checks for overfit (only valid when keep=False)
@@ -312,8 +470,9 @@ def _collinearity_check(data_frame, tolerance_level=1e-05):
     :return: (Pandas.DataFrame) Original DataFrame with collinear columns removed
     '''
 
-    data_array = data_frame.values
-    q_factor, r_factor = np.linalg.qr(data_array)
+    data_array = scipy.sparse.csr_matrix(data_frame.values)
+    data_array = data_array.T.dot(data_array)
+    _, r_factor = scipy.linalg.qr(data_array.toarray(), mode='economic')
     r_diagonal = np.abs(r_factor.diagonal())
     r_range = np.arange(r_diagonal.size)
 

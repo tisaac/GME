@@ -5,7 +5,7 @@ Summary: USITC's Gravity Modeling Environment
 Home-page: https://gravity.usitc.gov
 Author: USITC Gravity Modeling Group
 Author-email: gravity@usitc.gov
-License: Public Domain, CC0 1.0
+License: LICENSE.txt
 Description: This readme accompanies the Gravity Modeling Environment (GME) package.
         Created by the Gravity Modeling Group at the United States International Trade Commission (USITC).
         Gravity Modeling Group: https://www.usitc.gov/data/gravity/experts.htm.
