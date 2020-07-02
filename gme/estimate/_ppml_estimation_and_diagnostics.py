@@ -202,6 +202,50 @@ def _sectors(data_frame, meta_data):
 # PPML Regression and pre-diagnostics
 # -------------
 
+from petsc4py import PETSc
+
+class WLSMat(object):
+    def __init__(self, A, w):
+        self._wlsA = A
+        self._wlsw = w
+
+    def mult(self, mat, x, y):
+        z = self._wlsw.duplicate()
+        self._wlsA.mult(x, z)
+        z.pointwiseMult(z,self._wlsw)
+        self._wlsA.multTranspose(z, y)
+
+
+class PPML(object):
+    """
+    A^T (exp(A x) - y) = 0
+    """
+
+    def __init__(self, csr_mat, rhs):
+        m, n = csr_mat.shape
+        nz_per_row = csr_mat.indptr[1:] - csr_mat.indptr[:-1]
+        indptr = csr_mat.indptr.copy()
+        indices = csr_mat.indices.copy()
+        values = csr_mat.data.copy()
+        self.rhs = PETSc.Vec().createWithArray(rhs.copy(), size=m)
+        self.rhs.view()
+        self.mat = PETSc.Mat().createAIJWithArrays([m,n], (indptr, indices, values))
+        self.mat.view()
+
+    def formFunction(self, snes, X, F):
+        Y = self.rhs.duplicate()
+        self.mat.mult(X, Y)
+        Y.exp()
+        Y.axpy(-1.,self.rhs)
+        self.mat.multTranspose(Y, F)
+
+    def formJacobian(self, snes, X, J, P):
+        wls = J.getPythonContext()
+        wls._wlsA = self.mat
+        self.mat.mult(X, wls._wlsw)
+        wls._wlsw.exp()
+
+
 class _GLM(sm.GLM):
     """
     The same as a statsmodels Generalized Linear Model (GLM), but
@@ -216,8 +260,10 @@ class _GLM(sm.GLM):
         iteratively reweighted least squares (IRLS).
         """
 
+        import petsc4py
         import statsmodels.regression.linear_model as lm
         from statsmodels.genmod.generalized_linear_model import _check_convergence
+
 
         attach_wls = kwargs.pop('attach_wls', False)
         atol = kwargs.get('atol')
@@ -228,6 +274,17 @@ class _GLM(sm.GLM):
 
         endog = self.endog
         wlsexog = scipy.sparse.csr_matrix(self.exog)
+        ppml = PPML(wlsexog, endog)
+        snes = PETSc.SNES().create()
+        wlsmat = WLSMat(ppml.mat, ppml.rhs.duplicate())
+        J = PETSc.Mat().createPython([wlsexog.shape[1], wlsexog.shape[1]], context=wlsmat)
+        snes.setFunction(ppml.formFunction, ppml.mat.createVecRight())
+        snes.setJacobian(ppml.formJacobian, J)
+        snes.setFromOptions()
+        sol = ppml.mat.createVecRight()
+        snes.solve(None, sol)
+        sol.view()
+        
         if start_params is None:
             start_params = np.ones(self.exog.shape[1])
         sol = start_params
@@ -330,7 +387,7 @@ class _MinimalWLS(sm.regression._tools._MinimalWLS):
             self.wexog = scipy.sparse.spdiags(w_half, 0, len(w_half), len(w_half)) @ exog
 
     def fit(self, method='pinv'):
-        print(np.linalg.cond(self.wexog.toarray()), np.linalg.norm(self.wendog),np.linalg.norm(self.wexog.T.dot(self.wendog)))
+        print(np.linalg.norm(self.wendog),np.linalg.norm(self.wexog.T.dot(self.wendog)))
         result = scipy.sparse.linalg.lsmr(self.wexog, self.wendog, atol=1.e-16, btol=1.e-16)
         #result = np.linalg.lstsq(self.wexog.toarray(), self.wendog, rcond=-1)
         return self.results(result[0])
