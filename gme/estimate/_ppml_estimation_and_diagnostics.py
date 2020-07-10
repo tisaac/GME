@@ -228,22 +228,56 @@ class PPML(object):
         indices = csr_mat.indices.copy()
         values = csr_mat.data.copy()
         self.rhs = PETSc.Vec().createWithArray(rhs.copy(), size=m)
-        self.rhs.view()
+        #self.rhs.view()
         self.mat = PETSc.Mat().createAIJWithArrays([m,n], (indptr, indices, values))
-        self.mat.view()
+        nzrhs = np.log(rhs[rhs > 0.])
+        self.nzrhs = PETSc.Vec().createWithArray(nzrhs.copy(), size=len(nzrhs))
+        nzmat = scipy.sparse.csr_matrix(csr_mat[rhs > 0., :])
+        indptr = nzmat.indptr.copy()
+        indices = nzmat.indices.copy()
+        values = nzmat.data.copy()
+        self.nzmat = PETSc.Mat().createAIJWithArrays([nzmat.shape[0],nzmat.shape[1]], (indptr, indices, values))
+        self.nzpmat = self.nzmat.transposeMatMult(self.nzmat)
+        self.expy = self.rhs.duplicate()
+        self.res = self.rhs.duplicate()
+        self.expydiag = PETSc.Mat().createAIJ([m,m], nnz=np.ones(m, dtype=np.int32))
+        for i in range(m):
+            self.expydiag.setValue(i,i,1.)
+        self.expydiag.assemble()
+        self.pmat = self.expydiag.PtAP(self.mat)
+        #self.expydiag.view()
+        #self.mat.view()
+
+    def initGuess(self):
+        ksp = PETSc.KSP().create()
+        ksp.setOptionsPrefix('init_')
+        ksp.setType('lsqr')
+        ksp.setOperators(self.nzmat,self.nzpmat)
+        sol = self.nzmat.createVecRight()
+        ksp.setFromOptions()
+        ksp.solve(self.nzrhs, sol)
+        return sol
+
+    def formObjective(self, snes, X):
+        self.mat.mult(X, self.expy)
+        load = self.expy.dot(self.rhs)
+        self.expy.exp()
+        energy = self.expy.norm(norm_type=PETSc.NormType.NORM_1)
+        return energy - load
 
     def formFunction(self, snes, X, F):
-        Y = self.rhs.duplicate()
-        self.mat.mult(X, Y)
-        Y.exp()
-        Y.axpy(-1.,self.rhs)
-        self.mat.multTranspose(Y, F)
+        self.mat.mult(X, self.expy)
+        self.expy.exp()
+        self.expy.copy(self.res)
+        self.res.axpy(-1.,self.rhs)
+        self.mat.multTranspose(self.res, F)
 
     def formJacobian(self, snes, X, J, P):
         wls = J.getPythonContext()
-        wls._wlsA = self.mat
-        self.mat.mult(X, wls._wlsw)
-        wls._wlsw.exp()
+        self.expy.copy(wls._wlsw)
+        self.expydiag.setDiagonal(self.expy)
+        self.expydiag.assemble()
+        self.expydiag.PtAP(self.mat,P)
 
 
 class _GLM(sm.GLM):
@@ -260,11 +294,6 @@ class _GLM(sm.GLM):
         iteratively reweighted least squares (IRLS).
         """
 
-        import petsc4py
-        import statsmodels.regression.linear_model as lm
-        from statsmodels.genmod.generalized_linear_model import _check_convergence
-
-
         attach_wls = kwargs.pop('attach_wls', False)
         atol = kwargs.get('atol')
         rtol = kwargs.get('rtol', 0.)
@@ -277,87 +306,17 @@ class _GLM(sm.GLM):
         ppml = PPML(wlsexog, endog)
         snes = PETSc.SNES().create()
         wlsmat = WLSMat(ppml.mat, ppml.rhs.duplicate())
+
+        sol = ppml.initGuess()
         J = PETSc.Mat().createPython([wlsexog.shape[1], wlsexog.shape[1]], context=wlsmat)
+        P = ppml.pmat
+        snes.setObjective(ppml.formObjective)
         snes.setFunction(ppml.formFunction, ppml.mat.createVecRight())
-        snes.setJacobian(ppml.formJacobian, J)
+        snes.setJacobian(ppml.formJacobian, J, P)
         snes.setFromOptions()
-        sol = ppml.mat.createVecRight()
         snes.solve(None, sol)
-        sol.view()
-        
-        if start_params is None:
-            start_params = np.ones(self.exog.shape[1])
-        sol = start_params
-        lin_pred = wlsexog.dot(start_params) + self._offset_exposure
-        mu = self.family.fitted(lin_pred)
-        self.scale = self.estimate_scale(mu)
-        dev = self.family.deviance(self.endog, mu, self.var_weights,
-                                   self.freq_weights, self.scale)
-        if np.isnan(dev):
-            raise ValueError("The first guess on the deviance function "
-                             "returned a nan.  This could be a boundary "
-                             " problem and should be reported.")
-
-        # first guess on the deviance is assumed to be scaled by 1.
-        # params are none to start, so they line up with the deviance
-        history = dict(params=[np.inf, start_params], deviance=[np.inf, dev])
-        converged = False
-        criterion = history[tol_criterion]
-        # This special case is used to get the likelihood for a specific
-        # params vector.
-        if maxiter == 0:
-            mu = self.family.fitted(lin_pred)
-            self.scale = self.estimate_scale(mu)
-            wls_results = lm.RegressionResults(self, start_params, None)
-            sol = wls_results.params
-            iteration = 0
-        for iteration in range(maxiter):
-            print(iteration)
-            self.weights = (self.iweights * self.n_trials *
-                            self.family.weights(mu))
-            wlsendog = (self.family.link.deriv(mu) * (self.endog-mu)
-                        - self._offset_exposure)
-            wls_mod = _MinimalWLS(wlsendog, wlsexog,
-                                  self.weights, check_endog=True,
-                                  check_weights=True)
-            wls_results = wls_mod.fit(method=wls_method)
-            sol += wls_results.params
-            lin_pred = np.dot(self.exog, sol)
-            lin_pred += self._offset_exposure
-            mu = self.family.fitted(lin_pred)
-            print(np.linalg.norm(self.exog.T.dot(self.endog - mu)))
-            history = self._update_history(wls_results, mu, history)
-            self.scale = self.estimate_scale(mu)
-            if endog.squeeze().ndim == 1 and np.allclose(mu - endog, 0):
-                msg = "Perfect separation detected, results not available"
-                raise PerfectSeparationError(msg)
-            converged = _check_convergence(criterion, iteration + 1, atol,
-                                           rtol)
-            if converged:
-                break
-        self.mu = mu
-
-        if maxiter > 0:  # Only if iterative used
-            wls_method2 = 'pinv' if wls_method == 'lstsq' else wls_method
-            wls_model = lm.WLS(wlsendog, wlsexog, self.weights)
-            wls_results = wls_model.fit(method=wls_method2)
-
-        glm_results = sm.GLMResults(self, wls_results.params,
-                                    wls_results.normalized_cov_params,
-                                    self.scale,
-                                    cov_type=cov_type, cov_kwds=cov_kwds,
-                                    use_t=use_t)
-
-        glm_results.method = "IRLS"
-        glm_results.mle_settings = {}
-        glm_results.mle_settings['wls_method'] = wls_method
-        glm_results.mle_settings['optimizer'] = glm_results.method
-        if (maxiter > 0) and (attach_wls is True):
-            glm_results.results_wls = wls_results
-        history['iteration'] = iteration + 1
-        glm_results.fit_history = history
-        glm_results.converged = converged
-        return sm.GLMResultsWrapper(glm_results)
+        solarray = sol.getArray().copy()
+        return solarray
 
 
 class _MinimalWLS(sm.regression._tools._MinimalWLS):
@@ -388,8 +347,8 @@ class _MinimalWLS(sm.regression._tools._MinimalWLS):
 
     def fit(self, method='pinv'):
         print(np.linalg.norm(self.wendog),np.linalg.norm(self.wexog.T.dot(self.wendog)))
-        result = scipy.sparse.linalg.lsmr(self.wexog, self.wendog, atol=1.e-16, btol=1.e-16)
-        #result = np.linalg.lstsq(self.wexog.toarray(), self.wendog, rcond=-1)
+        #result = scipy.sparse.linalg.lsmr(self.wexog, self.wendog, atol=1.e-16, btol=1.e-16)
+        result = np.linalg.lstsq(self.wexog.toarray(), self.wendog, rcond=-1)
         return self.results(result[0])
 
 
@@ -423,11 +382,22 @@ def _regress_ppml(data_frame, specification):
     exclusion_column = pd.Series({'Number of Columns Excluded': len(excluded_column_list)})
     print('Omitted Columns: ' + str(excluded_column_list))
     # GLM Estimation
+    import time
     try:
-        glm = _GLM(endog=adjusted_data_frame[specification.lhs_var],
+        start = time.time()
+        glmpetsc = _GLM(endog=adjusted_data_frame[specification.lhs_var],
+                   exog=non_collinear_rhs,
+                   family=sm.families.Poisson())
+        estimates = glmpetsc.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit)
+        end = time.time()
+        print("petsc time", end-start)
+        start = time.time()
+        glm = sm.GLM(endog=adjusted_data_frame[specification.lhs_var],
                    exog=non_collinear_rhs,
                    family=sm.families.Poisson())
         estimates = glm.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit)
+        end = time.time()
+        print("statsmodels time", end-start)
         adjusted_data_frame.loc[:,'predicted_trade'] = estimates.mu
 
         # Checks for overfit (only valid when keep=False)
