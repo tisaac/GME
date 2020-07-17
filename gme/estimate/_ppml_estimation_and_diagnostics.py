@@ -204,19 +204,7 @@ def _sectors(data_frame, meta_data):
 
 from petsc4py import PETSc
 
-class WLSMat(object):
-    def __init__(self, A, w):
-        self._wlsA = A
-        self._wlsw = w
-
-    def mult(self, mat, x, y):
-        z = self._wlsw.duplicate()
-        self._wlsA.mult(x, z)
-        z.pointwiseMult(z,self._wlsw)
-        self._wlsA.multTranspose(z, y)
-
-
-class PPML(object):
+class PPML_PETSc(object):
     """
     A^T (exp(A x) - y) = 0
     """
@@ -273,14 +261,45 @@ class PPML(object):
         self.mat.multTranspose(self.res, F)
 
     def formJacobian(self, snes, X, J, P):
-        wls = J.getPythonContext()
-        self.expy.copy(wls._wlsw)
         self.expydiag.setDiagonal(self.expy)
         self.expydiag.assemble()
-        self.expydiag.PtAP(self.mat,P)
+        self.expydiag.PtAP(self.mat,J)
 
 
-class _GLM(sm.GLM):
+class PPML_scipy(object):
+    """
+    A^T (exp(A x) - y) = 0
+    """
+
+    def __init__(self, csr_mat, rhs):
+        m, n = csr_mat.shape
+        self.rhs = rhs.copy()
+        self.mat = csr_mat.copy()
+        self.nzrhs = np.log(rhs[rhs > 0.])
+        self.nzmat = scipy.sparse.csr_matrix(csr_mat[rhs > 0., :])
+        self.nzpmat = self.nzmat.T.dot(self.nzmat)
+
+    def initGuess(self):
+        sol = scipy.sparse.linalg.spsolve(self.nzpmat, self.nzmat.T @ self.nzrhs)
+        return sol
+
+    def formObjective(self, x):
+        Cx = self.mat @ x
+        load = Cx.dot(self.rhs)
+        energy = np.sum(np.exp(Cx))
+        return energy - load
+
+    def formFunction(self, x):
+        return self.mat.T @ (np.exp(self.mat @ x) - self.rhs)
+
+    def formJacobian(self, x):
+        expy = np.exp(self.mat @ x)
+        D = scipy.sparse.diags([expy], [0])
+        E = self.mat.T @ D @ self.mat
+        return E.toarray()
+
+
+class _GLM_PETSc(sm.GLM):
     """
     The same as a statsmodels Generalized Linear Model (GLM), but
     using sparse linear algebra from scipy within the iteratively reweighted
@@ -303,20 +322,45 @@ class _GLM(sm.GLM):
 
         endog = self.endog
         wlsexog = scipy.sparse.csr_matrix(self.exog)
-        ppml = PPML(wlsexog, endog)
+        ppml = PPML_PETSc(wlsexog, endog)
         snes = PETSc.SNES().create()
-        wlsmat = WLSMat(ppml.mat, ppml.rhs.duplicate())
-
         sol = ppml.initGuess()
-        J = PETSc.Mat().createPython([wlsexog.shape[1], wlsexog.shape[1]], context=wlsmat)
         P = ppml.pmat
         snes.setObjective(ppml.formObjective)
         snes.setFunction(ppml.formFunction, ppml.mat.createVecRight())
-        snes.setJacobian(ppml.formJacobian, J, P)
+        snes.setJacobian(ppml.formJacobian, P)
         snes.setFromOptions()
         snes.solve(None, sol)
         solarray = sol.getArray().copy()
         return solarray
+
+
+class _GLM_scipy(sm.GLM):
+    """
+    The same as a statsmodels Generalized Linear Model (GLM), but
+    using sparse linear algebra from scipy within the iteratively reweighted
+    least squares (IRLS) algorithm
+    """
+    def _fit_irls(self, start_params=None, maxiter=100, tol=1e-8,
+                  scale=None, cov_type='nonrobust', cov_kwds=None,
+                  use_t=None, **kwargs):
+        """
+        Fits a generalized linear model for a given family using
+        iteratively reweighted least squares (IRLS).
+        """
+
+        attach_wls = kwargs.pop('attach_wls', False)
+        atol = kwargs.get('atol')
+        rtol = kwargs.get('rtol', 0.)
+        tol_criterion = kwargs.get('tol_criterion', 'deviance')
+        wls_method = kwargs.get('wls_method', 'lstsq')
+        atol = tol if atol is None else atol
+
+        endog = self.endog
+        wlsexog = scipy.sparse.csr_matrix(self.exog)
+        ppml = PPML_scipy(wlsexog, endog)
+        result = scipy.optimize.minimize(ppml.formObjective, ppml.initGuess(), jac=ppml.formFunction, hess=ppml.formJacobian, method='Newton-CG')
+        return result
 
 
 class _MinimalWLS(sm.regression._tools._MinimalWLS):
@@ -385,17 +429,26 @@ def _regress_ppml(data_frame, specification):
     import time
     try:
         start = time.time()
-        glmpetsc = _GLM(endog=adjusted_data_frame[specification.lhs_var],
+        glmpetsc = _GLM_PETSc(endog=adjusted_data_frame[specification.lhs_var],
                    exog=non_collinear_rhs,
                    family=sm.families.Poisson())
-        estimates = glmpetsc.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit)
+        estimatespetsc = glmpetsc.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit)
         end = time.time()
         print("petsc time", end-start)
+        start = time.time()
+        glmscipy = _GLM_scipy(endog=adjusted_data_frame[specification.lhs_var],
+                   exog=non_collinear_rhs,
+                   family=sm.families.Poisson())
+        estimatesscipy = glmscipy.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit)
+        end = time.time()
+        print("scipy time", end-start)
         start = time.time()
         glm = sm.GLM(endog=adjusted_data_frame[specification.lhs_var],
                    exog=non_collinear_rhs,
                    family=sm.families.Poisson())
-        estimates = glm.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit)
+        import pdb
+        pdb.set_trace()
+        estimates = glm.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit, method='newton', max_start_irls=2)
         end = time.time()
         print("statsmodels time", end-start)
         adjusted_data_frame.loc[:,'predicted_trade'] = estimates.mu
@@ -478,7 +531,9 @@ def _collinearity_check(data_frame, tolerance_level=1e-05):
     '''
 
     data_array = data_frame.values
-    q_factor, r_factor = np.linalg.qr(data_array)
+    data_array = data_array.T.dot(data_array)
+    #q_factor, r_factor = np.linalg.qr(data_array, mode='reduced')
+    q_factor, r_factor = scipy.linalg.qr(data_array, mode='economic')
     r_diagonal = np.abs(r_factor.diagonal())
     r_range = np.arange(r_diagonal.size)
 
