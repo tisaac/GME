@@ -290,12 +290,16 @@ def _fit_newton_line_search(f, score, start_params, fargs, kwargs, disp=True,
     globalization on the objective using `scipy.optimize.line_search`.
     '''
     tol = kwargs.setdefault('tol', 1e-8)
+    exog = kwargs.setdefault('exog', None)
+    score_factor = kwargs.setdefault('score_factor', None)
+    hessian_factor = kwargs.setdefault('hessian_factor', None)
+    use_wls_steps = kwargs.setdefault('use_wls_steps', None)
     iterations = 0
-    oldparams = np.inf
     newparams = np.asarray(start_params)
     if retall:
-        history = [oldparams, newparams]
+        history = [newparams]
     obj = f(newparams)
+    delta_norm = np.inf
     while iterations < maxiter:
         g = score(newparams)
         H = np.asarray(hess(newparams))
@@ -308,14 +312,33 @@ def _fit_newton_line_search(f, score, start_params, fargs, kwargs, disp=True,
             # delta.dot(g), end optimization
             break
         delta *= alpha
-        newparams = newparams + delta
+        newparams += delta
         if retall:
             history.append(newparams)
         if callback is not None:
             callback(newparams)
-        if np.max(np.abs(delta)) < tol:
+        delta_norm = np.max(np.abs(delta))
+        if delta_norm <= tol:
             break
         iterations +=1
+    if all((delta_norm > tol, exog is not None, score_factor is not None, hessian_factor is not None, use_wls_steps)):
+        while iterations < maxiter:
+            sf = score_factor(newparams)
+            hf = hessian_factor(newparams)
+            sqhf = hf**0.5
+            rhs = sf / sqhf
+            A = scipy.sparse.diags([sqhf],[0]).dot(exog)
+            delta = np.linalg.lstsq(A, rhs, rcond=-1)[0]
+            newparams += delta
+            if retall:
+                history.append(newparams)
+            if callback is not None:
+                callback(newparams)
+            delta_norm = np.max(np.abs(delta))
+            if delta_norm <= tol:
+                break
+            iterations +=1
+
     fval = f(newparams, *fargs)  # this is the negative log-likelihood
     if iterations == maxiter:
         warnflag = 1
@@ -386,11 +409,17 @@ def _regress_ppml(data_frame, specification):
         olsrhs = olsexog.T.dot(olsendog)
         olsmat = olsexog.T.dot(olsexog)
         start_params = scipy.sparse.linalg.spsolve(olsmat,olsrhs)
+        score_factor = lambda params: spglm.score_factor(params)
+        hessian_factor = lambda params: spglm.hessian_factor(params)
         estimates = spglm.fit(cov_type=specification.std_errors,
                               start_params=start_params,
                               maxiter=specification.iteration_limit,
                               method='newton_line_search', max_start_irls=0,
-                              extra_fit_funcs={'newton_line_search':_fit_newton_line_search})
+                              extra_fit_funcs={'newton_line_search':_fit_newton_line_search},
+                              score_factor=score_factor,
+                              hessian_factor=hessian_factor,
+                              use_wls_steps=True,
+                              exog=spglm.exog)
         adjusted_data_frame.loc[:,'predicted_trade'] = estimates.mu
 
         # Checks for overfit (only valid when keep=False)
