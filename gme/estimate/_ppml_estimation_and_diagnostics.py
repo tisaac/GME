@@ -209,44 +209,75 @@ class PPML_PETSc(object):
     A^T (exp(A x) - y) = 0
     """
 
-    def __init__(self, csr_mat, rhs):
+    def __init__(self, csr_mat, rhs, gpu=False):
+        # Get the data PETSc needs to create its own sparse matrix from the
+        # scipy sparse matrix
         m, n = csr_mat.shape
         nz_per_row = csr_mat.indptr[1:] - csr_mat.indptr[:-1]
         indptr = csr_mat.indptr.copy()
         indices = csr_mat.indices.copy()
         values = csr_mat.data.copy()
-        self.rhs = PETSc.Vec().createWithArray(rhs.copy(), size=m)
-        #self.rhs.view()
         self.mat = PETSc.Mat().createAIJWithArrays([m,n], (indptr, indices, values))
+
+        if gpu:
+          # Construct the cusparse data structures on the GPU
+          self.mat.convert(self.mat.Type.SEQAIJCUSPARSE)
+          self.mat.setFromOptions()
+        # Create a PETSc vector object from the ndarray rhs
+        self.rhs = self.mat.createVecLeft()
+        self.rhs.setArray(rhs)
+
+        # create vectors to store exp(A x) and exp(A x) - y 
+        self.expy = self.rhs.duplicate()
+        self.res = self.rhs.duplicate()
+
+        # create a diagonal matrix for computing A^T @ diag(exp(A x)) @ A
+        self.expydiag = PETSc.Mat().createAIJ([m,m], nnz=np.ones(m, dtype=np.int32))
+        for i in range(m):
+            self.expydiag.setValue(i,i,1.)
+        self.expydiag.assemble()
+        if gpu:
+          self.expydiag.convert(self.mat.Type.SEQAIJCUSPARSE)
+        # create a matrix for storing the product A^T @ diag(exp(A x)) @ A
+        self.pmat = self.expydiag.PtAP(self.mat)
+
         nzrhs = np.log(rhs[rhs > 0.])
-        self.nzrhs = PETSc.Vec().createWithArray(nzrhs.copy(), size=len(nzrhs))
         nzmat = scipy.sparse.csr_matrix(csr_mat[rhs > 0., :])
         indptr = nzmat.indptr.copy()
         indices = nzmat.indices.copy()
         values = nzmat.data.copy()
         self.nzmat = PETSc.Mat().createAIJWithArrays([nzmat.shape[0],nzmat.shape[1]], (indptr, indices, values))
+        if gpu:
+          self.nzmat.convert(self.nzmat.Type.SEQAIJCUSPARSE)
+          self.nzmat.setFromOptions()
+        self.nzrhs = self.nzmat.createVecLeft()
+        self.nzrhs.setArray(nzrhs)
         self.nzpmat = self.nzmat.transposeMatMult(self.nzmat)
-        self.expy = self.rhs.duplicate()
-        self.res = self.rhs.duplicate()
-        self.expydiag = PETSc.Mat().createAIJ([m,m], nnz=np.ones(m, dtype=np.int32))
-        for i in range(m):
-            self.expydiag.setValue(i,i,1.)
-        self.expydiag.assemble()
-        self.pmat = self.expydiag.PtAP(self.mat)
-        #self.expydiag.view()
-        #self.mat.view()
+
 
     def initGuess(self):
+        """Initial guess based on solving the OLS problem Ax = log y
+        (where y > 0)"""
+
+        # create a linear solver context
         ksp = PETSc.KSP().create()
+        # give the solver a prefix for keys in the options database
         ksp.setOptionsPrefix('init_')
+        # use the iterative method LSQR to solve the least squares problem
         ksp.setType('lsqr')
+        # tell the linear solver context what A and A^T A are
+        # (A^T A will be used to either construct a direct solver or
+        # precondition the iterative method
         ksp.setOperators(self.nzmat,self.nzpmat)
         sol = self.nzmat.createVecRight()
+        # modify the default choices above with runtime options
         ksp.setFromOptions()
+        # solve the system
         ksp.solve(self.nzrhs, sol)
         return sol
 
     def formObjective(self, snes, X):
+        """Compute \|exp(A x)\|_1 - (Ax)^T y"""
         self.mat.mult(X, self.expy)
         load = self.expy.dot(self.rhs)
         self.expy.exp()
@@ -254,6 +285,7 @@ class PPML_PETSc(object):
         return energy - load
 
     def formFunction(self, snes, X, F):
+        """Compute A^T(exp(A x) - y)"""
         self.mat.mult(X, self.expy)
         self.expy.exp()
         self.expy.copy(self.res)
@@ -261,6 +293,7 @@ class PPML_PETSc(object):
         self.mat.multTranspose(self.res, F)
 
     def formJacobian(self, snes, X, J, P):
+        """Compute A^T diag(exp(A x)) A """
         self.expydiag.setDiagonal(self.expy)
         self.expydiag.assemble()
         self.expydiag.PtAP(self.mat,J)
@@ -322,13 +355,21 @@ class _GLM_PETSc(sm.GLM):
 
         endog = self.endog
         wlsexog = scipy.sparse.csr_matrix(self.exog)
-        ppml = PPML_PETSc(wlsexog, endog)
+
+        gpu = PETSc.Options().getBool('-gme_use_gpu', False)
+        ppml = PPML_PETSc(wlsexog, endog, gpu)
+
+        # create a nonlinear solver context
         snes = PETSc.SNES().create()
+        # get the initial guess from solving the OLS problem
         sol = ppml.initGuess()
         P = ppml.pmat
+        # use the functions and matrices defined above to define the
+        # nonlinear problem
         snes.setObjective(ppml.formObjective)
         snes.setFunction(ppml.formFunction, ppml.mat.createVecRight())
         snes.setJacobian(ppml.formJacobian, P)
+        # modify from the options database
         snes.setFromOptions()
         snes.solve(None, sol)
         solarray = sol.getArray().copy()
@@ -446,8 +487,6 @@ def _regress_ppml(data_frame, specification):
         glm = sm.GLM(endog=adjusted_data_frame[specification.lhs_var],
                    exog=non_collinear_rhs,
                    family=sm.families.Poisson())
-        import pdb
-        pdb.set_trace()
         estimates = glm.fit(cov_type=specification.std_errors, maxiter=specification.iteration_limit, method='newton', max_start_irls=2)
         end = time.time()
         print("statsmodels time", end-start)
